@@ -1,6 +1,8 @@
 """
 Turnstile solver pakai Patchright.
-Prinsip: JANGAN override UA/WebGL/viewport. Patchright handle semua.
+
+Fix: gunakan .replace() bukan .format() untuk hindari KeyError
+karena template HTML berisi kurung kurawal JS object literal.
 """
 import asyncio
 import logging
@@ -13,6 +15,7 @@ _pw = None
 _browser = None
 _browser_lock = asyncio.Lock()
 
+# Template HTML — placeholder pakai __XXX__ agar tidak bentrok dengan sintaks JS
 TURNSTILE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Loading</title></head>
@@ -23,11 +26,11 @@ TURNSTILE_HTML = """<!DOCTYPE html>
         function onTurnstileLoad() {
             try {
                 turnstile.render('.cf-turnstile', {
-                    sitekey: '{sitekey}',
-                    {action_line}
-                    {cdata_line}
+                    sitekey: '__SITEKEY__',
+                    __ACTION_LINE__
+                    __CDATA_LINE__
                     callback: function (token) {
-                        window.__ts.token = token;
+                        window.__ts.token = String(token);
                     },
                     'error-callback': function (err) {
                         window.__ts.error = String(err);
@@ -101,9 +104,12 @@ async def solve_turnstile(domain, sitekey, action=None, cdata=None,
                           proxy=None, timeout=90):
     action_line = f"action: '{action}'," if action else ""
     cdata_line  = f"cData: '{cdata}'," if cdata else ""
-    html = TURNSTILE_HTML.format(
-        sitekey=sitekey, action_line=action_line, cdata_line=cdata_line
-    )
+
+    # Gunakan replace, bukan .format()
+    html = TURNSTILE_HTML \
+        .replace("__SITEKEY__", sitekey) \
+        .replace("__ACTION_LINE__", action_line) \
+        .replace("__CDATA_LINE__", cdata_line)
 
     browser = await _get_browser()
     context_opts = {}
@@ -149,15 +155,31 @@ async def solve_turnstile(domain, sitekey, action=None, cdata=None,
         last_log = 0.0
 
         while asyncio.get_event_loop().time() < deadline:
-            try:
-                state = await page.evaluate(
-                    "() => window.__ts || { token: null, error: null, rendered: false }"
-                )
-            except Exception:
-                state = {}
+            token = None
+            error = None
+            rendered = False
 
-            token = state.get("token")
-            error = state.get("error")
+            try:
+                token = await page.evaluate(
+                    "() => (window.__ts && window.__ts.token) ? window.__ts.token : null"
+                )
+            except Exception as e:
+                log.warning(f"eval token err: {type(e).__name__}: {e}")
+
+            if not token:
+                try:
+                    error = await page.evaluate(
+                        "() => (window.__ts && window.__ts.error) ? String(window.__ts.error) : null"
+                    )
+                except Exception as e:
+                    log.warning(f"eval error err: {type(e).__name__}: {e}")
+
+            try:
+                rendered = bool(await page.evaluate(
+                    "() => !!(window.__ts && window.__ts.rendered)"
+                ))
+            except Exception:
+                pass
 
             if token and len(token) > 10:
                 log.info(f"Token OK ({len(token)} chars)")
@@ -170,10 +192,7 @@ async def solve_turnstile(domain, sitekey, action=None, cdata=None,
 
             now = asyncio.get_event_loop().time()
             if now - last_log >= 5:
-                log.info(
-                    f"Waiting rendered={state.get('rendered', False)} "
-                    f"t={int(now - (deadline - timeout))}s"
-                )
+                log.info(f"Waiting rendered={rendered} t={int(now - (deadline - timeout))}s")
                 last_log = now
 
             await asyncio.sleep(1)
